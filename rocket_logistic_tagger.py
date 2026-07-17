@@ -9,11 +9,12 @@ with app.setup:
     import numpy as np
     import polars as pl
     import matplotlib.pyplot as plt
+    import seaborn as sns
 
     from jet_util import load_images, pixelize, fetch_data_path
     from jet_dataloader import prepare_constituents
     from rocket import RocketTransform2D
-    from xgboost import XGBClassifier
+    from logistic import logistic_pipeline
     from sklearn.metrics import roc_auc_score, roc_curve, auc, confusion_matrix
     from sklearn.model_selection import StratifiedGroupKFold
 
@@ -21,22 +22,25 @@ with app.setup:
 @app.cell(hide_code=True)
 def _():
     mo.md("""
-    # QCD vs. top tagging — 2D-ROCKET features + XGBoost
+    # QCD vs. top tagging — 2D-ROCKET features + logistic regression
 
     Pipeline: **training images → augment (pT/position smear) → canonicalize →
-    2D-ROCKET featurize → XGBoost → evaluate on validation.**
+    2D-ROCKET featurize → logistic regression → evaluate on validation.**
 
     The ROCKET transform is frozen/random; its only *fitted* piece is the
-    per-kernel ppv bias, calibrated on the (augmented) training images. XGBoost
-    does all the actual learning on top of the fixed features.
+    per-kernel ppv bias, calibrated on the (augmented) training images. The linear
+    head (`logistic_pipeline`: StandardScaler → balanced-class-weighted, L2-penalized
+    softmax, solved by LBFGS) does the learning on top of the fixed features. This is
+    the classic ROCKET recipe — random kernels + a linear classifier — versus the
+    boosted-tree head in `rocket_xgb_tagger.py`.
     """)
     return
 
 
 @app.cell
 def _():
-    # Script mode (`uv run rocket_xgb_tagger.py`) uses small caps so the whole
-    # pipeline runs end-to-end quickly; interactive mode uses the slider values.
+    # Script mode (`uv run rocket_logistic_tagger.py`) uses small caps so the whole
+    # pipeline runs end-to-end quickly; interactive mode uses the control values.
     is_script_mode = mo.app_meta().mode == "script"
     return (is_script_mode,)
 
@@ -54,10 +58,8 @@ def _():
     l1_norm = mo.ui.checkbox(
         value=False, label="L1-normalize images (drops energy scale)"
     )
-    n_estimators = mo.ui.number(50, 1200, step=50, value=400, label="XGB trees")
-    max_depth = mo.ui.number(2, 10, step=1, value=5, label="XGB max_depth")
-    learning_rate = mo.ui.number(
-        0.01, 0.3, step=0.01, value=0.05, label="XGB learning_rate"
+    C = mo.ui.number(
+        0.01, 100.0, step=0.1, value=1.0, label="logreg C (inverse L2 strength)"
     )
     run_cv = mo.ui.checkbox(value=False, label="run 5-fold grouped CV (15 fits — slow)")
 
@@ -71,25 +73,11 @@ def _():
             pos_smear,
             n_aug,
             l1_norm,
-            n_estimators,
-            max_depth,
-            learning_rate,
+            C,
             run_cv,
         ]
     )
-    return (
-        l1_norm,
-        learning_rate,
-        max_depth,
-        n_aug,
-        n_biases,
-        n_estimators,
-        n_kernels,
-        pos_smear,
-        pt_smear,
-        run_cv,
-        seed,
-    )
+    return C, l1_norm, n_aug, n_biases, n_kernels, pos_smear, pt_smear, run_cv, seed
 
 
 @app.cell
@@ -230,7 +218,7 @@ def _(
     _rocket.fit(Xtr_img[_fit_idx])
 
     # Cache the features to disk, then drop the GPU-resident ROCKET module: there is
-    # no reason to keep the featurizer on the GPU while XGBoost trains (also on GPU).
+    # no reason to keep the featurizer on the GPU while the logistic head trains.
     feature_cache = "rocket_features.npz"
     np.savez(
         feature_cache,
@@ -246,7 +234,7 @@ def _(
 
 
 @app.cell
-def load_features(feature_cache):
+def load_features(feature_cache, np):
     # Features come back from disk, so the ROCKET module is already off the GPU.
     _features = np.load(feature_cache)
     Ftr = _features["Ftr"]
@@ -278,6 +266,7 @@ def combine_features(
     Ftest,
     Ftr,
     Fval,
+    np,
     phys_test,
     phys_train,
     phys_val,
@@ -313,34 +302,16 @@ def _(Ftr, Ftr_all, Fval_all, mo, phys_train):
 
 
 @app.cell
-def _(is_script_mode, learning_rate, max_depth, n_estimators, seed, ytr):
-    _trees = 60 if is_script_mode else n_estimators.value
-    # scale_pos_weight = n_neg / n_pos handles the ~1.9:1 QCD:top imbalance. It is a recall
-    # lever and AUC-neutral, so computing it once from the full train set is fine for CV too.
-    _scale_pos_weight = (ytr == 0).sum() / max((ytr == 1).sum(), 1)
-    _params = dict(
-        n_estimators=_trees,
-        max_depth=max_depth.value,
-        learning_rate=learning_rate.value,
-        subsample=0.8,
-        colsample_bytree=0.3,
-        scale_pos_weight=_scale_pos_weight,
-        eval_metric="auc",
-        tree_method="hist",
-        random_state=seed.value,
-        n_jobs=-1,
-    )
+def _(C):
+    # The logistic head carries its own StandardScaler and uses class_weight='balanced'
+    # internally, so no scale_pos_weight / manual scaling is needed here (unlike XGB).
+    _C = C.value
 
     def fit_head(Xt, yt):
-        # prefer GPU, fall back to CPU on OOM (the wide ROCKET matrices exceed 8 GB).
         # Takes its own y so it is reusable per CV fold, not just on the full train set.
-        try:
-            c = XGBClassifier(device="cuda", **_params)
-            c.fit(Xt, yt)
-        except Exception:
-            c = XGBClassifier(device="cpu", **_params)
-            c.fit(Xt, yt)
-        return c
+        clf = logistic_pipeline(C=_C)
+        clf.fit(Xt, yt)
+        return clf
 
     return (fit_head,)
 
@@ -353,7 +324,7 @@ def _(fit_head, routes, test_ids, ytr, yval):
     for _name, (_Xt, _Xv, _Xte) in routes.items():
         _clf = fit_head(_Xt, ytr)
         _val_p = _clf.predict_proba(_Xv)[:, 1]
-        _path = f"solutions_{_name}.csv"
+        _path = f"solutions_logreg_{_name}.csv"
         pl.DataFrame(
             {"id": test_ids, "label": _clf.predict_proba(_Xte)[:, 1]}
         ).write_csv(_path)
@@ -374,7 +345,7 @@ def _(results, yval):
     _ax.plot([0, 1], [0, 1], "--", color="grey")
     _ax.set_xlabel("False positive rate")
     _ax.set_ylabel("True positive rate")
-    _ax.set_title("ROC — validation, by route")
+    _ax.set_title("ROC — validation, by route (logistic)")
     _ax.legend(loc="lower right")
 
     _rows = "\n".join(
@@ -394,7 +365,14 @@ def _(results, yval):
 
 
 @app.cell
-def _(fit_head, routes, run_cv, seed, tr_idx, ytr):
+def _(
+    fit_head,
+    routes,
+    run_cv,
+    seed,
+    tr_idx,
+    ytr,
+):
     mo.stop(
         not run_cv.value,
         mo.md(
